@@ -126,7 +126,10 @@ const jobId = await snooze.schedule(
 - `workerId?: string`: Identifier for the worker instance (default: random UUID).
 - `concurrency?: number`: Max jobs processed simultaneously by this worker (default: `10`).
 - `leaseDurationMs?: number`: Lock duration in ms before considering a worker crashed (default: `30000`).
+- `heartbeatIntervalMs?: number`: Interval in ms to renew lease during execution (default: `leaseDurationMs / 2`).
 - `recoveryIntervalMs?: number`: Interval in ms between safety sweeps (default: `30000`).
+- `recoveryBatchSize?: number`: Maximum jobs reclaimed per sweep (default: `100`).
+- `tokenSaveIntervalMs?: number`: Interval in ms to flush resume token writes (default: `1000`).
 - `enableRecovery?: boolean`: Whether to run recovery sweeps (default: `true`).
 - `shutdownTimeoutMs?: number`: Graceful shutdown timeout in ms (default: `10000`).
 - `defaultMaxAttempts?: number`: Default max retry attempts (default: `3`).
@@ -138,6 +141,9 @@ Registers a handler function for job `name`.
 ```typescript
 snooze.define<{ orderId: string }>("order-timeout", async (job) => {
   console.log(job.id, job.name, job.data, job.attempts);
+
+  // For long-running tasks, manually extend the lease:
+  await job.touch(30_000); // extends lease by 30 seconds
 });
 ```
 
@@ -149,6 +155,7 @@ Options:
 - `jobId?: string`: Custom unique job ID.
 - `maxAttempts?: number`: Overrides default max retries.
 - `backoffMs?: number`: Overrides retry base backoff.
+- `backoffFactor?: number`: Overrides exponential multiplier.
 
 ### `snooze.cancel(jobId)`
 Cancels a pending or failed job. If the TTL event later fires, it is safely ignored.
@@ -178,9 +185,32 @@ snooze.on("job:completed", (job, result) => { ... });
 snooze.on("job:failed", (job, error) => { ... });
 snooze.on("job:retrying", (job, error, nextRunAt) => { ... });
 snooze.on("job:cancelled", (jobId) => { ... });
+snooze.on("job:rescheduled", (jobId, newRunAt) => { ... });
 snooze.on("recovery:sweep", (stats) => { ... });
 snooze.on("error", (err) => { ... });
 ```
+
+---
+
+## 🛑 Custom Errors
+
+MongoSnooze exports typed error classes for programmatic handling:
+
+- `MongoSnoozeError`: Base error class.
+- `ReplicaSetRequiredError`: Thrown/emitted if MongoDB is running in standalone mode.
+- `IndexConflictError`: Thrown if existing collections have conflicting index options.
+- `LeaseLostError`: Emitted if an in-flight job's lock was stolen by another worker or recovery sweep.
+- `HandlerNotRegisteredError`: Thrown if a job is dequeued without a registered handler.
+- `JobNotFoundError`: Thrown when querying a non-existent job ID.
+
+---
+
+## 📚 Further Reading
+
+- [Architecture RFC & Tradeoffs](ARCHITECTURE.md): In-depth look at Change Streams, TTL limits, and dual-collection mechanics.
+- [Contributing Guide](CONTRIBUTING.md): Setting up local development and running tests.
+- [Changelog](CHANGELOG.md): Version history and release notes.
+- [Security Policy](SECURITY.md): Vulnerability disclosure guidelines.
 
 ---
 

@@ -15,8 +15,12 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
@@ -35,8 +39,16 @@
     "ttl",
     "typescript"
   ],
-  "author": "",
+  "author": "Harsh",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/harsh/mongosnooze.git"
+  },
+  "homepage": "https://github.com/harsh/mongosnooze#readme",
+  "bugs": {
+    "url": "https://github.com/harsh/mongosnooze/issues"
+  },
   "peerDependencies": {
     "mongodb": ">=5.0.0 <7.0.0"
   },
