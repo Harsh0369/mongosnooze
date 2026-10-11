@@ -42,7 +42,6 @@ export interface ScheduleOptions {
   runAt?: Date;
   /**
    * Delay in milliseconds from now when the job should run.
-   * Mutually exclusive with runAt (or used if runAt is not provided).
    */
   delayMs?: number;
   /**
@@ -90,6 +89,11 @@ export interface MongoSnoozeOptions {
    */
   leaseDurationMs?: number;
   /**
+   * Interval in milliseconds for automatic background lease heartbeat during job execution.
+   * Defaults to leaseDurationMs / 2.
+   */
+  heartbeatIntervalMs?: number;
+  /**
    * Maximum number of concurrent jobs this worker instance will process simultaneously.
    * Default: 10.
    */
@@ -100,6 +104,11 @@ export interface MongoSnoozeOptions {
    */
   recoveryIntervalMs?: number;
   /**
+   * Batch size limit for recovering pending jobs in a single sweep.
+   * Default: 100.
+   */
+  recoveryBatchSize?: number;
+  /**
    * Whether to enable the safety recovery sweeper.
    * Default: true.
    */
@@ -109,6 +118,11 @@ export interface MongoSnoozeOptions {
    * Default: 10000 (10 seconds).
    */
   shutdownTimeoutMs?: number;
+  /**
+   * Interval in milliseconds for debouncing resume token persistence to the database.
+   * Default: 1000 (1 second).
+   */
+  tokenSaveIntervalMs?: number;
   /**
    * Default maximum retry attempts for registered jobs.
    * Default: 3.
@@ -136,6 +150,11 @@ export interface JobInfo<T = any> {
   maxAttempts: number;
   runAt: Date;
   createdAt: Date;
+  /**
+   * Manually extends the lease of this running job by extraMs milliseconds.
+   * Returns true if lease was successfully renewed, false if lease was lost.
+   */
+  touch: (extraMs?: number) => Promise<boolean>;
 }
 
 export interface MongoSnoozeEvents {

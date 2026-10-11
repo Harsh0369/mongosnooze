@@ -4,10 +4,19 @@ export class MockCollection {
   public docs = new Map<string, any>();
   public indexes: any[] = [];
   public changeStreamListeners: ((change: any) => void)[] = [];
+  public errorListeners: ((err: any) => void)[] = [];
+  public shouldFailWithIndexConflict = false;
+  public shouldFailWithReplicaSet = false;
 
   constructor(public readonly name: string) {}
 
   async createIndex(keys: any, options?: any) {
+    if (this.shouldFailWithIndexConflict) {
+      const err: any = new Error("Index already exists with different options");
+      err.code = 85;
+      err.codeName = "IndexOptionsConflict";
+      throw err;
+    }
     this.indexes.push({ keys, options });
     return "mock_index";
   }
@@ -18,9 +27,9 @@ export class MockCollection {
     return { acknowledged: true, insertedId: doc._id };
   }
 
-  async findOne(query: any) {
+  async findOne(filter: any) {
     for (const doc of this.docs.values()) {
-      if (this.matches(doc, query)) {
+      if (this.matches(doc, filter)) {
         return JSON.parse(JSON.stringify(doc));
       }
     }
@@ -62,7 +71,6 @@ export class MockCollection {
     for (const [id, doc] of this.docs.entries()) {
       if (this.matches(doc, filter)) {
         this.docs.delete(id);
-        // Emit change event if simulated
         this.changeStreamListeners.forEach((listener) =>
           listener({
             operationType: "delete",
@@ -75,7 +83,7 @@ export class MockCollection {
     return { deletedCount: 0 };
   }
 
-  async findOneAndUpdate(filter: any, update: any, options?: any) {
+  async findOneAndUpdate(filter: any, update: any) {
     for (const [id, doc] of this.docs.entries()) {
       if (this.matches(doc, filter)) {
         this.applyUpdate(doc, update);
@@ -110,10 +118,21 @@ export class MockCollection {
   }
 
   watch() {
+    if (this.shouldFailWithReplicaSet) {
+      const err: any = new Error(
+        "The $changeStream stage is only supported on replica sets"
+      );
+      err.code = 40573;
+      err.codeName = "Location40573";
+      throw err;
+    }
+
     const emitter: any = {
-      on: (event: string, handler: (change: any) => void) => {
+      on: (event: string, handler: (data: any) => void) => {
         if (event === "change") {
           this.changeStreamListeners.push(handler);
+        } else if (event === "error") {
+          this.errorListeners.push(handler);
         }
         return emitter;
       },

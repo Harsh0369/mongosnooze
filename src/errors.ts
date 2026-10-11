@@ -27,3 +27,19 @@ export class ReplicaSetRequiredError extends MongoSnoozeError {
     this.name = "ReplicaSetRequiredError";
   }
 }
+
+export class IndexConflictError extends MongoSnoozeError {
+  constructor(public readonly originalError: Error) {
+    super(
+      `An incompatible index already exists on the collection. Please migrate or drop the existing conflicting index: ${originalError.message}`
+    );
+    this.name = "IndexConflictError";
+  }
+}
+
+export class LeaseLostError extends MongoSnoozeError {
+  constructor(public readonly jobId: string) {
+    super(`Worker lost execution lease for job "${jobId}" to another worker or recovery sweep.`);
+    this.name = "LeaseLostError";
+  }
+}

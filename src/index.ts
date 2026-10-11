@@ -4,6 +4,8 @@ export {
   JobNotFoundError,
   HandlerNotRegisteredError,
   ReplicaSetRequiredError,
+  IndexConflictError,
+  LeaseLostError,
 } from "./errors.js";
 export type {
   JobDocument,

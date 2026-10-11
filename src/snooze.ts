@@ -10,7 +10,6 @@ import type {
   JobDocument,
   JobHandler,
   JobInfo,
-  MongoSnoozeEvents,
   MongoSnoozeOptions,
   ScheduleOptions,
   WakeupDocument,
@@ -18,7 +17,9 @@ import type {
 } from "./types.js";
 import {
   HandlerNotRegisteredError,
+  IndexConflictError,
   JobNotFoundError,
+  LeaseLostError,
   MongoSnoozeError,
   ReplicaSetRequiredError,
 } from "./errors.js";
@@ -28,10 +29,13 @@ export class MongoSnooze extends EventEmitter {
   private readonly prefix: string;
   public readonly workerId: string;
   private readonly leaseDurationMs: number;
+  private readonly heartbeatIntervalMs: number;
   private readonly concurrency: number;
   private readonly recoveryIntervalMs: number;
+  private readonly recoveryBatchSize: number;
   private readonly enableRecovery: boolean;
   private readonly shutdownTimeoutMs: number;
+  private readonly tokenSaveIntervalMs: number;
   private readonly defaultMaxAttempts: number;
   private readonly defaultBackoffMs: number;
   private readonly defaultBackoffFactor: number;
@@ -43,11 +47,17 @@ export class MongoSnooze extends EventEmitter {
   private readonly handlers = new Map<string, JobHandler>();
   private changeStream: ChangeStream | null = null;
   private recoveryTimer: NodeJS.Timeout | null = null;
+  private tokenSaveTimer: NodeJS.Timeout | null = null;
+  private latestResumeToken: any = null;
+
   private isRunning = false;
   private isStopping = false;
   private activeJobsCount = 0;
   private readonly inFlightPromises = new Set<Promise<void>>();
+
+  // Deduplicated queue for wakeups
   private readonly pendingWakeupQueue: string[] = [];
+  private readonly pendingWakeupSet = new Set<string>();
 
   constructor(options: MongoSnoozeOptions) {
     super();
@@ -60,10 +70,14 @@ export class MongoSnooze extends EventEmitter {
     this.prefix = options.collectionPrefix || "mongosnooze";
     this.workerId = options.workerId || `worker_${randomUUID()}`;
     this.leaseDurationMs = options.leaseDurationMs ?? 30_000;
+    this.heartbeatIntervalMs =
+      options.heartbeatIntervalMs ?? Math.max(1000, Math.floor(this.leaseDurationMs / 2));
     this.concurrency = options.concurrency ?? 10;
     this.recoveryIntervalMs = options.recoveryIntervalMs ?? 30_000;
+    this.recoveryBatchSize = options.recoveryBatchSize ?? 100;
     this.enableRecovery = options.enableRecovery ?? true;
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 10_000;
+    this.tokenSaveIntervalMs = options.tokenSaveIntervalMs ?? 1_000;
     this.defaultMaxAttempts = options.defaultMaxAttempts ?? 3;
     this.defaultBackoffMs = options.defaultBackoffMs ?? 5_000;
     this.defaultBackoffFactor = options.defaultBackoffFactor ?? 2;
@@ -80,6 +94,19 @@ export class MongoSnooze extends EventEmitter {
   }
 
   /**
+   * Emits an event safely, preventing process crashes if an 'error' event has no listeners.
+   */
+  private safeEmit(event: string, ...args: any[]): boolean {
+    if (event === "error" && this.listenerCount("error") === 0) {
+      const err = args[0];
+      const message = err instanceof Error ? err.stack || err.message : String(err);
+      console.error(`[MongoSnooze Unhandled Error] ${message}`);
+      return false;
+    }
+    return this.emit(event, ...args);
+  }
+
+  /**
    * Initializes MongoDB collections and necessary indexes.
    * Creates:
    * - TTL index on `{ expireAt: 1 }` with `expireAfterSeconds: 0` on wakeups collection.
@@ -87,31 +114,46 @@ export class MongoSnooze extends EventEmitter {
    * - Compound index on `{ status: 1, leaseExpiresAt: 1 }` on jobs collection.
    */
   public async initialize(): Promise<void> {
-    // 1. Wakeups TTL index
-    await this.wakeupsCollection.createIndex(
-      { expireAt: 1 },
-      { expireAfterSeconds: 0, name: "mongosnooze_ttl_index" }
-    );
+    try {
+      // 1. Wakeups TTL index
+      await this.wakeupsCollection.createIndex(
+        { expireAt: 1 },
+        { expireAfterSeconds: 0, name: "mongosnooze_ttl_index" }
+      );
 
-    // 2. Jobs recovery & polling safety indexes
-    await this.jobsCollection.createIndex(
-      { status: 1, runAt: 1 },
-      { name: "mongosnooze_status_runAt" }
-    );
-    await this.jobsCollection.createIndex(
-      { status: 1, leaseExpiresAt: 1 },
-      { name: "mongosnooze_status_lease" }
-    );
-    await this.jobsCollection.createIndex(
-      { name: 1 },
-      { name: "mongosnooze_job_name" }
-    );
+      // 2. Jobs recovery & polling safety indexes
+      await this.jobsCollection.createIndex(
+        { status: 1, runAt: 1 },
+        { name: "mongosnooze_status_runAt" }
+      );
+      await this.jobsCollection.createIndex(
+        { status: 1, leaseExpiresAt: 1 },
+        { name: "mongosnooze_status_lease" }
+      );
+      await this.jobsCollection.createIndex(
+        { name: 1 },
+        { name: "mongosnooze_job_name" }
+      );
+    } catch (err: any) {
+      if (
+        err?.code === 85 || // IndexOptionsConflict
+        err?.code === 86 || // IndexKeySpecsConflict
+        err?.codeName === "IndexOptionsConflict" ||
+        err?.codeName === "IndexKeySpecsConflict"
+      ) {
+        throw new IndexConflictError(err);
+      }
+      throw err;
+    }
   }
 
   /**
    * Registers a job handler for a specific job name.
    */
   public define<T = any>(name: string, handler: JobHandler<T>): this {
+    if (!name || typeof name !== "string") {
+      throw new MongoSnoozeError("Job name must be a non-empty string.");
+    }
     if (typeof handler !== "function") {
       throw new MongoSnoozeError(`Handler for job "${name}" must be a function.`);
     }
@@ -120,24 +162,53 @@ export class MongoSnooze extends EventEmitter {
   }
 
   /**
-   * Schedules a delayed job.
+   * Schedules a delayed job with validation.
    */
   public async schedule<T = any>(
     name: string,
     data: T,
     options: ScheduleOptions = {}
   ): Promise<string> {
+    if (!name || typeof name !== "string") {
+      throw new MongoSnoozeError("Job name must be a non-empty string.");
+    }
+
     let runAt: Date;
     if (options.runAt instanceof Date) {
       runAt = options.runAt;
-    } else if (typeof options.delayMs === "number" && options.delayMs >= 0) {
+    } else if (typeof options.delayMs === "number") {
+      if (options.delayMs < 0 || !Number.isFinite(options.delayMs)) {
+        throw new MongoSnoozeError("'delayMs' must be a non-negative finite number.");
+      }
       runAt = new Date(Date.now() + options.delayMs);
     } else {
-      runAt = new Date(); // Due immediately if no timing specified
+      runAt = new Date();
     }
 
     if (isNaN(runAt.getTime())) {
       throw new MongoSnoozeError("Invalid 'runAt' date provided for job.");
+    }
+
+    if (options.maxAttempts !== undefined) {
+      if (!Number.isInteger(options.maxAttempts) || options.maxAttempts < 1) {
+        throw new MongoSnoozeError("'maxAttempts' must be a positive integer.");
+      }
+    }
+
+    if (options.backoffMs !== undefined) {
+      if (!Number.isFinite(options.backoffMs) || options.backoffMs < 0) {
+        throw new MongoSnoozeError("'backoffMs' must be a non-negative number.");
+      }
+    }
+
+    if (options.backoffFactor !== undefined) {
+      if (!Number.isFinite(options.backoffFactor) || options.backoffFactor < 1) {
+        throw new MongoSnoozeError("'backoffFactor' must be a number >= 1.");
+      }
+    }
+
+    if (options.jobId !== undefined && (!options.jobId || typeof options.jobId !== "string")) {
+      throw new MongoSnoozeError("'jobId' must be a non-empty string if provided.");
     }
 
     const jobId = options.jobId || randomUUID();
@@ -170,7 +241,7 @@ export class MongoSnooze extends EventEmitter {
       { upsert: true }
     );
 
-    this.emit("job:scheduled", jobDoc);
+    this.safeEmit("job:scheduled", jobDoc);
     return jobId;
   }
 
@@ -178,16 +249,23 @@ export class MongoSnooze extends EventEmitter {
    * Cancels a pending job. Stale wakeup events will safely ignore cancelled jobs.
    */
   public async cancel(jobId: string): Promise<boolean> {
+    if (!jobId || typeof jobId !== "string") {
+      throw new MongoSnoozeError("Job ID must be a non-empty string.");
+    }
+
     const now = new Date();
     const result = await this.jobsCollection.updateOne(
       { _id: jobId, status: { $in: ["pending", "failed"] } },
       { $set: { status: "cancelled", updatedAt: now } }
     );
 
-    await this.wakeupsCollection.deleteOne({ _id: jobId });
+    await this.wakeupsCollection.deleteOne({ _id: jobId }).catch(() => {});
+
+    // Remove from in-memory queue if present
+    this.pendingWakeupSet.delete(jobId);
 
     if (result.matchedCount > 0) {
-      this.emit("job:cancelled", jobId);
+      this.safeEmit("job:cancelled", jobId);
       return true;
     }
 
@@ -198,6 +276,9 @@ export class MongoSnooze extends EventEmitter {
    * Reschedules an existing job to a new time.
    */
   public async reschedule(jobId: string, newRunAt: Date): Promise<boolean> {
+    if (!jobId || typeof jobId !== "string") {
+      throw new MongoSnoozeError("Job ID must be a non-empty string.");
+    }
     if (!(newRunAt instanceof Date) || isNaN(newRunAt.getTime())) {
       throw new MongoSnoozeError("Invalid 'newRunAt' date provided.");
     }
@@ -224,7 +305,7 @@ export class MongoSnooze extends EventEmitter {
       { upsert: true }
     );
 
-    this.emit("job:rescheduled", jobId, newRunAt);
+    this.safeEmit("job:rescheduled", jobId, newRunAt);
     return true;
   }
 
@@ -232,14 +313,14 @@ export class MongoSnooze extends EventEmitter {
    * Retrieves a job document by ID.
    */
   public async getJob<T = any>(jobId: string): Promise<JobDocument<T> | null> {
+    if (!jobId || typeof jobId !== "string") {
+      throw new MongoSnoozeError("Job ID must be a non-empty string.");
+    }
     return this.jobsCollection.findOne({ _id: jobId }) as Promise<JobDocument<T> | null>;
   }
 
   /**
-   * Starts the MongoSnooze worker:
-   * 1. Ensures indexes are initialized.
-   * 2. Starts the Change Stream on the wakeups collection.
-   * 3. Starts the safety recovery sweeper.
+   * Starts the MongoSnooze worker.
    */
   public async start(): Promise<void> {
     if (this.isRunning) {
@@ -253,28 +334,31 @@ export class MongoSnooze extends EventEmitter {
     await this.startChangeStream();
 
     if (this.enableRecovery) {
-      // Run an immediate recovery sweep on startup to catch jobs missed during downtime
-      await this.runRecoverySweep().catch((err) => this.emit("error", err));
+      // Immediate startup sweep
+      await this.runRecoverySweep().catch((err) => this.safeEmit("error", err));
 
-      // Schedule periodic recovery sweeps
+      // Periodic recovery sweeper
       this.recoveryTimer = setInterval(() => {
-        this.runRecoverySweep().catch((err) => this.emit("error", err));
+        this.runRecoverySweep().catch((err) => this.safeEmit("error", err));
       }, this.recoveryIntervalMs);
 
-      // Prevent the timer from holding Node.js event loop open if stopped
       if (this.recoveryTimer.unref) {
         this.recoveryTimer.unref();
       }
     }
+
+    // Debounced token save sweeper
+    this.tokenSaveTimer = setInterval(() => {
+      this.flushResumeToken().catch(() => {});
+    }, this.tokenSaveIntervalMs);
+
+    if (this.tokenSaveTimer.unref) {
+      this.tokenSaveTimer.unref();
+    }
   }
 
   /**
-   * Gracefully stops the worker:
-   * 1. Stops accepting new wakeups.
-   * 2. Stops the recovery sweeper.
-   * 3. Closes Change Stream.
-   * 4. Awaits active in-flight jobs up to `shutdownTimeoutMs`.
-   * 5. Releases any remaining locked jobs back to pending.
+   * Gracefully stops the worker.
    */
   public async stop(): Promise<void> {
     if (!this.isRunning || this.isStopping) {
@@ -289,12 +373,19 @@ export class MongoSnooze extends EventEmitter {
       this.recoveryTimer = null;
     }
 
+    if (this.tokenSaveTimer) {
+      clearInterval(this.tokenSaveTimer);
+      this.tokenSaveTimer = null;
+    }
+
+    await this.flushResumeToken().catch(() => {});
+
     if (this.changeStream) {
       await this.changeStream.close().catch(() => {});
       this.changeStream = null;
     }
 
-    // Wait for in-flight jobs
+    // Await in-flight jobs up to shutdown timeout
     if (this.inFlightPromises.size > 0) {
       const waitAll = Promise.all(Array.from(this.inFlightPromises));
       const timeoutPromise = new Promise((resolve) =>
@@ -304,7 +395,7 @@ export class MongoSnooze extends EventEmitter {
       await Promise.race([waitAll, timeoutPromise]);
     }
 
-    // Release any lingering leases held by this worker
+    // Release any lingering uncompleted leases
     const now = new Date();
     await this.jobsCollection.updateMany(
       { lockedBy: this.workerId, status: "running" },
@@ -319,6 +410,8 @@ export class MongoSnooze extends EventEmitter {
       }
     ).catch(() => {});
 
+    this.pendingWakeupQueue.length = 0;
+    this.pendingWakeupSet.clear();
     this.isStopping = false;
   }
 
@@ -343,17 +436,14 @@ export class MongoSnooze extends EventEmitter {
     try {
       this.changeStream = this.wakeupsCollection.watch(pipeline, streamOptions);
     } catch (err: any) {
-      if (
-        err?.message?.includes("replica set") ||
-        err?.codeName === "Location40573" ||
-        err?.code === 40573
-      ) {
+      if (this.isReplicaSetError(err)) {
+        this.isRunning = false;
         throw new ReplicaSetRequiredError();
       }
       throw err;
     }
 
-    this.changeStream.on("change", async (change: ChangeStreamDocument<WakeupDocument>) => {
+    this.changeStream.on("change", (change: ChangeStreamDocument<WakeupDocument>) => {
       if (!this.isRunning || this.isStopping) return;
 
       if (change.operationType === "delete") {
@@ -363,46 +453,62 @@ export class MongoSnooze extends EventEmitter {
         }
       }
 
-      // Persist latest resume token
       if (change._id) {
-        this.saveResumeToken(change._id).catch(() => {});
+        this.latestResumeToken = change._id;
       }
     });
 
     this.changeStream.on("error", async (err: any) => {
       if (this.isStopping || !this.isRunning) return;
 
-      this.emit("error", err);
+      if (this.isReplicaSetError(err)) {
+        this.isRunning = false;
+        this.safeEmit("error", new ReplicaSetRequiredError());
+        return; // Do not reconnect on non-replica set
+      }
 
-      // If the resume token is stale/lost (oplog history rolled over), restart without it
+      this.safeEmit("error", err);
+
       const isOplogLost =
-        err?.code === 286 || // ChangeStreamHistoryLost
+        err?.code === 286 ||
         err?.codeName === "ChangeStreamHistoryLost" ||
         err?.message?.includes("resume token");
 
       if (isOplogLost) {
+        this.latestResumeToken = null;
         await this.metaCollection.deleteOne({ _id: "resume_token" }).catch(() => {});
       }
 
-      // Reconnect change stream after short backoff
+      // Reconnect after short backoff
       setTimeout(async () => {
         if (this.isRunning && !this.isStopping) {
           try {
             await this.startChangeStream();
             await this.runRecoverySweep();
           } catch (reconnectErr: any) {
-            this.emit("error", reconnectErr);
+            this.safeEmit("error", reconnectErr);
           }
         }
       }, 2000);
     });
   }
 
-  private async saveResumeToken(token: any): Promise<void> {
+  private isReplicaSetError(err: any): boolean {
+    return (
+      err?.message?.includes("replica set") ||
+      err?.message?.includes("$changeStream stage is only supported on replica sets") ||
+      err?.codeName === "Location40573" ||
+      err?.code === 40573
+    );
+  }
+
+  private async flushResumeToken(): Promise<void> {
+    if (!this.latestResumeToken) return;
+    const tokenToSave = this.latestResumeToken;
     try {
       await this.metaCollection.updateOne(
         { _id: "resume_token" },
-        { $set: { resumeToken: token, updatedAt: new Date() } },
+        { $set: { resumeToken: tokenToSave, updatedAt: new Date() } },
         { upsert: true }
       );
     } catch {
@@ -411,7 +517,12 @@ export class MongoSnooze extends EventEmitter {
   }
 
   private enqueueWakeup(jobId: string): void {
+    if (this.pendingWakeupSet.has(jobId)) {
+      return; // Deduplicate
+    }
+
     if (this.activeJobsCount >= this.concurrency) {
+      this.pendingWakeupSet.add(jobId);
       this.pendingWakeupQueue.push(jobId);
       return;
     }
@@ -425,6 +536,7 @@ export class MongoSnooze extends EventEmitter {
 
     const nextId = this.pendingWakeupQueue.shift();
     if (nextId) {
+      this.pendingWakeupSet.delete(nextId);
       this.processJob(nextId);
     }
   }
@@ -442,19 +554,24 @@ export class MongoSnooze extends EventEmitter {
   }
 
   private async runJob(jobId: string): Promise<void> {
+    // Add small random jitter (0-20ms) to reduce contention across multiple workers
+    const jitter = Math.floor(Math.random() * 20);
+    if (jitter > 0) {
+      await new Promise((r) => setTimeout(r, jitter));
+    }
+
     try {
       const claimed = await this.claimJob(jobId);
       if (claimed) {
         await this.executeJob(claimed);
       }
     } catch (err: any) {
-      this.emit("error", err);
+      this.safeEmit("error", err);
     }
   }
 
   /**
    * Atomically claims an eligible job for this worker.
-   * Multi-worker safe: uses findOneAndUpdate with lease and status criteria.
    */
   private async claimJob(jobId: string): Promise<JobDocument | null> {
     const now = new Date();
@@ -484,6 +601,17 @@ export class MongoSnooze extends EventEmitter {
 
   private async executeJob(jobDoc: JobDocument): Promise<void> {
     const handler = this.handlers.get(jobDoc.name);
+
+    // Job touch helper allowing developer to manually extend the lease
+    const touch = async (extraMs = this.leaseDurationMs): Promise<boolean> => {
+      const newLease = new Date(Date.now() + extraMs);
+      const res = await this.jobsCollection.updateOne(
+        { _id: jobDoc._id, lockedBy: this.workerId, status: "running" },
+        { $set: { leaseExpiresAt: newLease, updatedAt: new Date() } }
+      );
+      return res.matchedCount > 0;
+    };
+
     const jobInfo: JobInfo = {
       id: jobDoc._id,
       name: jobDoc.name,
@@ -492,6 +620,7 @@ export class MongoSnooze extends EventEmitter {
       maxAttempts: jobDoc.maxAttempts,
       runAt: jobDoc.runAt,
       createdAt: jobDoc.createdAt,
+      touch,
     };
 
     if (!handler) {
@@ -500,20 +629,40 @@ export class MongoSnooze extends EventEmitter {
       return;
     }
 
-    this.emit("job:started", jobInfo);
+    this.safeEmit("job:started", jobInfo);
+
+    // Auto-heartbeat: periodically extend lease during execution to protect long tasks
+    const heartbeat = setInterval(async () => {
+      try {
+        const renewed = await touch(this.leaseDurationMs);
+        if (!renewed) {
+          clearInterval(heartbeat);
+        }
+      } catch {
+        clearInterval(heartbeat);
+      }
+    }, this.heartbeatIntervalMs);
+
+    if (heartbeat.unref) {
+      heartbeat.unref();
+    }
 
     try {
       const result = await handler(jobInfo);
+      clearInterval(heartbeat);
       await this.handleJobSuccess(jobDoc, result);
     } catch (err: any) {
+      clearInterval(heartbeat);
       await this.handleJobFailure(jobDoc, err);
     }
   }
 
   private async handleJobSuccess(jobDoc: JobDocument, result: any): Promise<void> {
     const now = new Date();
-    await this.jobsCollection.updateOne(
-      { _id: jobDoc._id },
+
+    // Enforce atomic ownership: only mark completed if WE still hold the lock!
+    const updateResult = await this.jobsCollection.updateOne(
+      { _id: jobDoc._id, lockedBy: this.workerId, status: "running" },
       {
         $set: {
           status: "completed",
@@ -526,7 +675,13 @@ export class MongoSnooze extends EventEmitter {
       }
     );
 
-    // Clean up wakeup doc if it somehow still exists
+    if (updateResult.matchedCount === 0) {
+      // Lease was stolen by another worker or recovery sweep!
+      this.safeEmit("error", new LeaseLostError(jobDoc._id));
+      return;
+    }
+
+    // Clean up wakeup doc if it still exists
     await this.wakeupsCollection.deleteOne({ _id: jobDoc._id }).catch(() => {});
 
     const jobInfo: JobInfo = {
@@ -537,9 +692,10 @@ export class MongoSnooze extends EventEmitter {
       maxAttempts: jobDoc.maxAttempts,
       runAt: jobDoc.runAt,
       createdAt: jobDoc.createdAt,
+      touch: async () => false,
     };
 
-    this.emit("job:completed", jobInfo, result);
+    this.safeEmit("job:completed", jobInfo, result);
   }
 
   private async handleJobFailure(jobDoc: JobDocument, error: any): Promise<void> {
@@ -556,16 +712,16 @@ export class MongoSnooze extends EventEmitter {
       maxAttempts: jobDoc.maxAttempts,
       runAt: jobDoc.runAt,
       createdAt: jobDoc.createdAt,
+      touch: async () => false,
     };
 
     if (attempts < jobDoc.maxAttempts) {
-      // Calculate exponential backoff
       const backoffMs =
         jobDoc.backoffMs * Math.pow(jobDoc.backoffFactor, attempts - 1);
       const nextRunAt = new Date(now.getTime() + backoffMs);
 
-      await this.jobsCollection.updateOne(
-        { _id: jobDoc._id },
+      const updateResult = await this.jobsCollection.updateOne(
+        { _id: jobDoc._id, lockedBy: this.workerId, status: "running" },
         {
           $set: {
             status: "pending",
@@ -579,18 +735,21 @@ export class MongoSnooze extends EventEmitter {
         }
       );
 
-      // Re-create TTL trigger in wakeups collection for the retry time
+      if (updateResult.matchedCount === 0) {
+        this.safeEmit("error", new LeaseLostError(jobDoc._id));
+        return;
+      }
+
       await this.wakeupsCollection.updateOne(
         { _id: jobDoc._id },
         { $set: { _id: jobDoc._id, expireAt: nextRunAt } },
         { upsert: true }
       );
 
-      this.emit("job:retrying", jobInfo, error, nextRunAt);
+      this.safeEmit("job:retrying", jobInfo, error, nextRunAt);
     } else {
-      // Max attempts exceeded: mark permanently failed
-      await this.jobsCollection.updateOne(
-        { _id: jobDoc._id },
+      const updateResult = await this.jobsCollection.updateOne(
+        { _id: jobDoc._id, lockedBy: this.workerId, status: "running" },
         {
           $set: {
             status: "failed",
@@ -603,8 +762,13 @@ export class MongoSnooze extends EventEmitter {
         }
       );
 
+      if (updateResult.matchedCount === 0) {
+        this.safeEmit("error", new LeaseLostError(jobDoc._id));
+        return;
+      }
+
       await this.wakeupsCollection.deleteOne({ _id: jobDoc._id }).catch(() => {});
-      this.emit("job:failed", jobInfo, error);
+      this.safeEmit("job:failed", jobInfo, error);
     }
   }
 
@@ -627,7 +791,6 @@ export class MongoSnooze extends EventEmitter {
 
     for await (const job of expiredLeaseCursor) {
       if (job.attempts < job.maxAttempts) {
-        // Reset to pending so it can be re-run
         await this.jobsCollection.updateOne(
           { _id: job._id, status: "running" },
           {
@@ -643,7 +806,6 @@ export class MongoSnooze extends EventEmitter {
         this.enqueueWakeup(job._id);
         recoveredLeases++;
       } else {
-        // Mark failed
         await this.jobsCollection.updateOne(
           { _id: job._id, status: "running" },
           {
@@ -660,13 +822,13 @@ export class MongoSnooze extends EventEmitter {
       }
     }
 
-    // 2. Recover pending jobs that are due but missed trigger (e.g. worker was offline)
+    // 2. Recover pending jobs that are due but missed trigger
     const missedPendingCursor = this.jobsCollection
       .find({
         status: "pending",
         runAt: { $lte: now },
       })
-      .limit(100);
+      .limit(this.recoveryBatchSize);
 
     for await (const job of missedPendingCursor) {
       this.enqueueWakeup(job._id);
@@ -675,7 +837,7 @@ export class MongoSnooze extends EventEmitter {
 
     const stats = { recoveredLeases, recoveredPending };
     if (recoveredLeases > 0 || recoveredPending > 0) {
-      this.emit("recovery:sweep", stats);
+      this.safeEmit("recovery:sweep", stats);
     }
 
     return stats;
