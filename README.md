@@ -4,6 +4,7 @@
 > Lightweight, MongoDB-native delayed-job triggers using Change Streams and TTL wakeups. No Redis required.
 
 [![npm version](https://img.shields.io/npm/v/mongosnooze.svg?style=flat-square)](https://www.npmjs.com/package/mongosnooze)
+[![GitHub](https://img.shields.io/badge/GitHub-Harsh0369%2Fmongosnooze-181717?style=flat-square&logo=github)](https://github.com/Harsh0369/mongosnooze)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg?style=flat-square)](https://www.typescriptlang.org/)
 

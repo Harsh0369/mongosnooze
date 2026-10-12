@@ -39,15 +39,15 @@
     "ttl",
     "typescript"
   ],
-  "author": "Harsh",
+  "author": "Harsh0369",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/harsh/mongosnooze.git"
+    "url": "git+https://github.com/Harsh0369/mongosnooze.git"
   },
-  "homepage": "https://github.com/harsh/mongosnooze#readme",
+  "homepage": "https://github.com/Harsh0369/mongosnooze#readme",
   "bugs": {
-    "url": "https://github.com/harsh/mongosnooze/issues"
+    "url": "https://github.com/Harsh0369/mongosnooze/issues"
   },
   "peerDependencies": {
     "mongodb": ">=5.0.0 <7.0.0"

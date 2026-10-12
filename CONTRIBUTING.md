@@ -14,7 +14,7 @@ Thank you for your interest in contributing to **MongoSnooze**! We welcome bug r
 ### Installation
 1. Fork and clone the repository:
    ```bash
-   git clone https://github.com/your-username/mongosnooze.git
+   git clone https://github.com/Harsh0369/mongosnooze.git
    cd mongosnooze
    ```
 2. Install dependencies:
