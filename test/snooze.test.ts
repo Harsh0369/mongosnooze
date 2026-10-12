@@ -176,7 +176,7 @@ describe("MongoSnooze - Production Hardened", () => {
       const snooze = new MongoSnooze({
         db: mockDb,
         defaultMaxAttempts: 2,
-        defaultBackoffMs: 50,
+        defaultBackoffMs: 10,
       });
 
       let attemptsCount = 0;
@@ -194,16 +194,19 @@ describe("MongoSnooze - Production Hardened", () => {
       const wakeups = mockDb.collection("mongosnooze_wakeups") as MockCollection;
       // Trigger attempt 1
       await wakeups.deleteOne({ _id: jobId });
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 60));
 
       expect(attemptsCount).toBe(1);
       let job = await snooze.getJob(jobId);
       expect(job?.status).toBe("pending");
       expect(job?.attempts).toBe(1);
 
+      // Wait for backoff delay (10ms) to elapse so runAt <= now
+      await new Promise((r) => setTimeout(r, 30));
+
       // Trigger retry (attempt 2)
       await wakeups.deleteOne({ _id: jobId });
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 80));
 
       expect(attemptsCount).toBe(2);
       job = await snooze.getJob(jobId);
