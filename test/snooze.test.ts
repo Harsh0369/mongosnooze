@@ -216,4 +216,143 @@ describe("MongoSnooze - Production Hardened", () => {
       await snooze.stop();
     });
   });
+
+  describe("Job Lifecycle & Management", () => {
+    it("should cancel a scheduled job and remove wakeup trigger", async () => {
+      const snooze = new MongoSnooze({ db: mockDb });
+      const jobId = await snooze.schedule("reminder", { msg: "Hello" }, { delayMs: 10_000 });
+
+      const cancelled = await snooze.cancel(jobId);
+      expect(cancelled).toBe(true);
+
+      const job = await snooze.getJob(jobId);
+      expect(job?.status).toBe("cancelled");
+
+      const wakeups = mockDb.collection("mongosnooze_wakeups") as MockCollection;
+      const wakeupDoc = await wakeups.findOne({ _id: jobId });
+      expect(wakeupDoc).toBeNull();
+    });
+
+    it("should reschedule an existing job to a new time", async () => {
+      const snooze = new MongoSnooze({ db: mockDb });
+      const initialRunAt = new Date(Date.now() + 5_000);
+      const newRunAt = new Date(Date.now() + 60_000);
+
+      const jobId = await snooze.schedule("reminder", {}, { runAt: initialRunAt });
+      const rescheduled = await snooze.reschedule(jobId, newRunAt);
+      expect(rescheduled).toBe(true);
+
+      const job = await snooze.getJob(jobId);
+      expect(new Date(job!.runAt).getTime()).toBe(newRunAt.getTime());
+
+      const wakeups = mockDb.collection("mongosnooze_wakeups") as MockCollection;
+      const wakeupDoc = await wakeups.findOne({ _id: jobId });
+      expect(new Date(wakeupDoc.expireAt).getTime()).toBe(newRunAt.getTime());
+    });
+  });
+
+  describe("Safety Recovery Sweeper (Downtime & Crashes)", () => {
+    it("should recover pending due jobs that missed change stream events during worker downtime", async () => {
+      const snooze = new MongoSnooze({ db: mockDb });
+      const handlerFn = vi.fn().mockResolvedValue("recovered_ok");
+      snooze.define("missed-job", handlerFn);
+
+      // Directly insert a pending job scheduled while worker was offline
+      const jobs = mockDb.collection("mongosnooze_jobs") as MockCollection;
+      const dueTime = new Date(Date.now() - 10_000);
+      await jobs.insertOne({
+        _id: "missed_1",
+        name: "missed-job",
+        data: { text: "offline payload" },
+        status: "pending",
+        runAt: dueTime,
+        attempts: 0,
+        maxAttempts: 3,
+        backoffMs: 5000,
+        backoffFactor: 2,
+        lockedBy: null,
+        lockedAt: null,
+        leaseExpiresAt: null,
+        createdAt: dueTime,
+        updatedAt: dueTime,
+      });
+
+      const stats = await snooze.runRecoverySweep();
+      expect(stats.recoveredPending).toBe(1);
+
+      await new Promise((r) => setTimeout(r, 60));
+      expect(handlerFn).toHaveBeenCalledTimes(1);
+
+      const job = await snooze.getJob("missed_1");
+      expect(job?.status).toBe("completed");
+    });
+
+    it("should recover orphaned jobs whose worker crashed and lease expired", async () => {
+      const snooze = new MongoSnooze({ db: mockDb });
+      const handlerFn = vi.fn().mockResolvedValue("lease_recovered_ok");
+      snooze.define("crashed-worker-job", handlerFn);
+
+      // Directly insert a job locked by a worker that crashed
+      const jobs = mockDb.collection("mongosnooze_jobs") as MockCollection;
+      const expiredLease = new Date(Date.now() - 60_000);
+      await jobs.insertOne({
+        _id: "crashed_1",
+        name: "crashed-worker-job",
+        data: {},
+        status: "running",
+        runAt: new Date(Date.now() - 120_000),
+        attempts: 1,
+        maxAttempts: 3,
+        backoffMs: 5000,
+        backoffFactor: 2,
+        lockedBy: "dead_worker_999",
+        lockedAt: new Date(Date.now() - 90_000),
+        leaseExpiresAt: expiredLease,
+        createdAt: new Date(Date.now() - 120_000),
+        updatedAt: new Date(Date.now() - 90_000),
+      });
+
+      const stats = await snooze.runRecoverySweep();
+      expect(stats.recoveredLeases).toBe(1);
+
+      await new Promise((r) => setTimeout(r, 60));
+      expect(handlerFn).toHaveBeenCalledTimes(1);
+
+      const job = await snooze.getJob("crashed_1");
+      expect(job?.status).toBe("completed");
+    });
+  });
+
+  describe("Graceful Shutdown", () => {
+    it("should release locked jobs held by this worker back to pending on stop()", async () => {
+      const snooze = new MongoSnooze({ db: mockDb, workerId: "worker_to_stop" });
+      const jobs = mockDb.collection("mongosnooze_jobs") as MockCollection;
+
+      // Simulate a job actively locked by this worker
+      await jobs.insertOne({
+        _id: "locked_job_1",
+        name: "in-flight",
+        data: {},
+        status: "running",
+        runAt: new Date(),
+        attempts: 1,
+        maxAttempts: 3,
+        backoffMs: 5000,
+        backoffFactor: 2,
+        lockedBy: "worker_to_stop",
+        lockedAt: new Date(),
+        leaseExpiresAt: new Date(Date.now() + 30_000),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      await snooze.start();
+      await snooze.stop();
+
+      const job = await snooze.getJob("locked_job_1");
+      expect(job?.status).toBe("pending");
+      expect(job?.lockedBy).toBeNull();
+      expect(job?.leaseExpiresAt).toBeNull();
+    });
+  });
 });

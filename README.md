@@ -45,7 +45,7 @@ Node.js developers frequently need persistent delayed tasks (reminders, trial ex
 ```
 
 ### Why this design?
-Relying solely on a TTL delete event is dangerous: if workers go offline and MongoDB oplog rolls over, the payload is permanently lost. MongoSnooze separates the **durable job record** (`_jobs`) from the **disposable trigger** (`_wakeups`). Even if an oplog event is missed, the periodic recovery sweeper guarantees your job runs.
+Relying solely on a TTL delete event is dangerous: if workers go offline and MongoDB oplog rolls over, the payload is permanently lost. MongoSnooze separates the **durable job record** (`_jobs`) from the **disposable trigger** (`_wakeups`). Even if an oplog event is missed or rolls off during worker downtime, the periodic recovery sweeper helps discover and reconcile eligible pending jobs.
 
 ---
 
@@ -53,7 +53,7 @@ Relying solely on a TTL delete event is dangerous: if workers go offline and Mon
 
 | Tool | Best Fit | Infrastructure | Idle Polling |
 | :--- | :--- | :--- | :--- |
-| **MongoSnooze** | **Lightweight delayed triggers, reminders, state transitions** | **MongoDB only** | **No** (Change Stream triggered) |
+| **MongoSnooze** | **Lightweight delayed triggers, reminders, state transitions** | **MongoDB only** | **No continuous job polling** (event-driven Change Streams + periodic recovery sweeps) |
 | **BullMQ** | Heavyweight message queues, complex parent-child flows, high throughput | Redis required | Depends on configuration |
 | **Agenda** | Established MongoDB-backed cron and recurring scheduling | MongoDB only | Periodic polling queries |
 | `setTimeout` | Ephemeral, non-critical in-memory timers | None | None (lost on restart) |
@@ -109,7 +109,7 @@ await snooze.start();
 const jobId = await snooze.schedule(
   "send-welcome-email",
   { userId: "usr_123" },
-  { delayMs: 60_000 } // Runs in 1 minute
+  { delayMs: 60_000 } // Eligible after 1 minute; actual execution depends on MongoDB TTL sweep
 );
 
 // Or schedule for a specific Date:
