@@ -15,10 +15,10 @@
 Node.js developers frequently need persistent delayed tasks (reminders, trial expiry emails, workflow timeouts, or cleanup jobs). However, existing solutions often force an architectural compromise:
 
 - **Redis queues (e.g. BullMQ):** Powerful and rich, but requires running, maintaining, and paying for a separate Redis cluster.
-- **Continuous polling schedulers (e.g. Agenda):** Can cause continuous query noise against your primary database even when idle.
+- **Polling-based schedulers:** Periodic checks can generate database queries even when no jobs are due. Agenda v6 also offers an optional MongoDB Change Stream notification channel.
 - **In-memory timers (`setTimeout`):** Work disappears whenever your server restarts or scales.
 
-**MongoSnooze** gives you durable, delayed-job execution using only your existing MongoDB database. It combines MongoDB TTL indexes for fast, event-driven Change Stream notifications with a durable job record and safety-net recovery.
+**MongoSnooze** gives you durable, delayed-job execution using only your existing MongoDB database. It combines MongoDB TTL deletions as wakeup signals via Change Streams with a durable job record and safety-net recovery.
 
 ---
 
@@ -34,7 +34,7 @@ Node.js developers frequently need persistent delayed tasks (reminders, trial ex
               MongoDB TTL index automatically expires & deletes document.
                    │
                    ▼ (Delete Event)
-           3. Change Stream Worker (Fast Notification Path)
+           3. Change Stream Worker (Event-Driven Wakeup)
               Atomically claims job lease via findOneAndUpdate.
               Executes handler & marks job completed.
                    │
@@ -53,9 +53,9 @@ Relying solely on a TTL delete event is dangerous: if workers go offline and Mon
 
 | Tool | Best Fit | Infrastructure | Idle Polling |
 | :--- | :--- | :--- | :--- |
-| **MongoSnooze** | **Lightweight delayed triggers, reminders, state transitions** | **MongoDB only** | **No continuous job polling** (event-driven Change Streams + periodic recovery sweeps) |
+| **MongoSnooze** | **Lightweight delayed triggers, reminders, state transitions** | **MongoDB only** | TTL-driven Change Stream wakeups and periodic recovery sweeps |
 | **BullMQ** | Heavyweight message queues, complex parent-child flows, high throughput | Redis required | Depends on configuration |
-| **Agenda** | Established MongoDB-backed cron and recurring scheduling | MongoDB only | Periodic polling queries |
+| **[Agenda v6](https://github.com/agenda/agenda)** | One-off and recurring jobs, including cron schedules | MongoDB backend available | Polling and optional native MongoDB Change Stream notifications |
 | `setTimeout` | Ephemeral, non-critical in-memory timers | None | None (lost on restart) |
 
 ---
@@ -65,7 +65,7 @@ Relying solely on a TTL delete event is dangerous: if workers go offline and Mon
 1. **MongoDB Replica Set or Atlas Required:**  
    MongoDB Change Streams require a replica set or sharded cluster. MongoSnooze will not work on a standalone `mongod` instance without replica set support.
 2. **Timing Accuracy:**  
-   MongoDB's background TTL monitor runs once every 60 seconds. Therefore, MongoSnooze is designed for delayed tasks, reminders, and timeouts, not sub-second real-time precision.
+   Jobs become eligible at the scheduled time. Actual execution can happen later depending on MongoDB's [TTL deletion timing](https://www.mongodb.com/docs/manual/core/index-ttl/), recovery sweep timing, and worker availability. Use MongoSnooze for tasks that tolerate scheduling delays.
 3. **At-Least-Once Delivery:**  
    If a worker crashes halfway through sending an email before marking the job complete, the recovery engine will re-claim the job. **Handlers should be designed to be idempotent.**
 
@@ -109,7 +109,7 @@ await snooze.start();
 const jobId = await snooze.schedule(
   "send-welcome-email",
   { userId: "usr_123" },
-  { delayMs: 60_000 } // Eligible after 1 minute; actual execution depends on MongoDB TTL sweep
+  { delayMs: 60_000 } // Eligible after 1 minute; execution depends on wakeup or recovery timing and worker availability
 );
 
 // Or schedule for a specific Date:
@@ -151,7 +151,7 @@ snooze.define<{ orderId: string }>("order-timeout", async (job) => {
 ### `snooze.schedule<T>(name, data, options?)`
 Schedules a job. Returns the generated or specified `jobId`.
 Options:
-- `runAt?: Date`: The exact time to execute.
+- `runAt?: Date`: The earliest time the job is eligible to run.
 - `delayMs?: number`: Milliseconds from now.
 - `jobId?: string`: Custom unique job ID.
 - `maxAttempts?: number`: Overrides default max retries.
